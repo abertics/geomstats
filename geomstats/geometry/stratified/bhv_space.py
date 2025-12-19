@@ -16,18 +16,23 @@ References
     https://doi.org/10.1109/TCBB.2010.3
 """
 
+import itertools
 import itertools as it
+from abc import ABC
 
 import networkx as nx
 import numpy as np
 
 import geomstats.backend as gs
+from geomstats.geometry.fiber_bundle import AlignerAlgorithm
+from geomstats.geometry.group_action import GroupAction
 from geomstats.geometry.stratified.point_set import (
     Point,
     PointBatch,
     PointSet,
     PointSetMetric,
 )
+from geomstats.geometry.stratified.quotient import Aligner
 from geomstats.geometry.stratified.trees import (
     ForestTopology,
     Split,
@@ -395,6 +400,42 @@ class TreeSpace(PointSet):
 
         return TreeBatch(trees)
 
+    def new(self, equip=True):
+        """Create TreeSpace with same parameters."""
+        return TreeSpace(
+            n_labels=self.n_labels,
+            equip=equip,
+        )
+
+    def equip_with_group_action(self, group_action="permutations"):
+        """Equip manifold with group action."""
+        if group_action == "permutations":
+            group_action = LeafPermutationAction()
+        self.group_action = group_action
+
+        # Tragically BHV isn't a manifold
+        # return super().equip_with_group_action(group_action)
+
+        return self
+
+    def equip_with_quotient(self):
+        """Equip ___ with quotient structure.
+
+        Creates attribute`aligner` because the notion
+        of fiber bundle is not defined..
+
+        Returns
+        -------
+        quotient : not a Manifold
+            Quotient space equipped with a quotient metric.
+        """
+        self.aligner = TreeSpaceAligner(self)
+
+        self.quotient = self.new(equip=False)
+        self.quotient.equip_with_metric(BHVQuotientMetric, total_space=self)
+
+        return self.quotient
+
 
 class BHVMetric(PointSetMetric):
     """BHV metric for Tree Space for phylogenetic trees.
@@ -411,8 +452,7 @@ class BHVMetric(PointSetMetric):
 
     Parameters
     ----------
-    total_space : TreeSpace
-        Set with quotient structure.
+    space : TreeSpace
     """
 
     def __init__(self, space):
@@ -910,3 +950,259 @@ class GTPSolver:
         v = set(v)
         v_bar = set(v_bar)
         return min_value, tuple(a & v_bar), tuple(a & v), tuple(b & v_bar), tuple(b & v)
+
+
+class LeafPermutationAction(GroupAction):
+    """Congruence action of the permutation group on Tree labels."""
+
+    def __call__(self, group_elem, point):
+        """Congruence action of a group element on a Tree.
+
+        Parameters
+        ----------
+        group_elem : array-like, shape=[..., n]
+            Permutations where in position i we have the value j meaning
+            the node i should be permuted with node j.
+        point : Tree
+            A point in BHV space.
+
+        Returns
+        -------
+        orbit_point : Tree
+            A point on the orbit of point.
+        """
+        perm_map = {i: j for i, j in enumerate(group_elem)}
+        splits = point.topology.splits
+
+        new_splits = []
+        for split in splits:
+            p1, p2 = split.part1, split.part2
+
+            new_p1 = set(perm_map[p] for p in p1)
+            new_p2 = set(perm_map[p] for p in p2)
+            new_splits.append(Split(new_p1, new_p2))
+
+        if len(new_splits) == 0:
+            return point  # CURSED STAR TREE
+        return Tree(new_splits, point.lengths)
+
+
+class TreeSpaceAlignerAlgorithm(AlignerAlgorithm, ABC):
+    """Base class for tree space numerical aligner.
+
+    Attributes
+    ----------
+    total_space : TreeSpace
+    perm_ : array-like, shape=[..., n_labels]
+        Node permutations where in position i we have the value j meaning
+        the node i should be permuted with node j.
+    """
+
+    def __init__(self, total_space):
+        super().__init__(total_space)
+        self.perm_ = None
+
+    def _get_opt_perm_single(self, tree, base_tree):
+        """Get optimal element of the group.
+
+        Parameters
+        ----------
+        point : array-like, shape=[..., n_nodes, n_nodes]
+            Graph to align.
+        base_point : array-like, shape=[..., n_nodes, n_nodes]
+            Base graph.
+
+        Returns
+        -------
+        perm : array-like, shape=[..., n_nodes]
+            Optimal permutation group element.
+        """
+        raise NotImplementedError
+
+    def _get_opt_perm(self, point, base_point):
+        """Get optimal element of the group.
+
+        Parameters
+        ----------
+        point : Tree
+            Tree to align.
+        base_point : Tree
+            Base tree.
+
+        Returns
+        -------
+        perm : array-like, shape=[..., n_nodes]
+            Optimal permutation group element.
+        """
+        # is_batch = check_is_batch(self._total_space.n_labels, point, base_point)
+        # if is_batch:
+        #     if point.ndim != base_point.ndim:
+        #         point, base_point = gs.broadcast_arrays(point, base_point)
+        #     return gs.stack(
+        #         [
+        #             self._get_opt_perm_single(point_, base_point_)
+        #             for point_, base_point_ in zip(point, base_point)
+        #         ]
+        #     )
+        return self._get_opt_perm_single(point, base_point)
+
+    def align(self, point, base_point):
+        """Align point to base point.
+
+        Parameters
+        ----------
+        point :  Tree
+            Tree to align.
+        base_point : Tree
+            Reference tree.
+
+        Returns
+        -------
+        aligned_point : Tree
+            Aligned tree.
+        """
+        self.perm_ = self._get_opt_perm(point, base_point)
+        return self._total_space.group_action(self.perm_, point)
+
+
+class ExhaustiveTreeAligner(TreeSpaceAlignerAlgorithm):
+    """Brute force exact alignment.
+
+    Exact Alignment obtained by exploring the whole permutation group.
+
+    Parameters
+    ----------
+    total_space : TreeSpace
+
+
+    Notes
+    -----
+    Not recommended for large `n_labels`.
+    """
+
+    def __init__(self, total_space):
+        super().__init__(total_space)
+        self._perms = list(itertools.permutations(range(total_space.n_labels)))
+
+    def _get_opt_perm_single(self, tree, base_tree):
+        """Get optimal element of the group.
+
+        Parameters
+        ----------
+        point : Tree
+            Tree to align.
+        base_point : Tree
+            Base tree.
+
+        Returns
+        -------
+        perm : array-like, shape=[n_nodes]
+            Optimal permutation group element.
+        """
+        dists = []
+        for perm in self._perms:
+            relabeled = self._total_space.group_action(perm, tree)
+            dists.append(self._total_space.metric.dist(base_tree, relabeled))
+        return self._perms[gs.argmin(gs.array(dists))]
+
+
+class TreeSpaceAligner(Aligner):
+    """Tree space aligner.
+
+    Parameters
+    ----------
+    total_space : TreeSpace
+        BHV space.
+    align_algo : TreeSpaceAlignerAlgorithm
+        Algorithm performing alignment.
+    """
+
+    def __init__(self, total_space, align_alg=None):
+        super().__init__(total_space, align_alg)
+        if align_alg is None:
+            self.align_algo = ExhaustiveTreeAligner(total_space)
+
+
+class BHVQuotientMetric(BHVMetric):
+    """Class for Tree Space Metric, invariant to label permutations.
+
+    Note: normally quotient metrics inherit from QuotientMetric.
+    The problem is QuotientMetric inhereits from RiemannianMetric, which is
+    no good here.
+
+    Instead we will copy over and override the necessary functions here.
+    """
+
+    def __init__(self, space, total_space=None):
+        if total_space is None:
+            total_space = TreeSpace(space.n_labels, equip=False)
+            total_space.equip_with_metric()
+
+        if not hasattr(total_space, "group_action"):
+            total_space.equip_with_group_action()
+
+        if not hasattr(total_space, "quotient"):
+            total_space.equip_with_quotient()
+
+        self._total_space = total_space
+
+        super().__init__(space=space)
+
+    def dist(self, point_a, point_b):
+        """Compute the minimum-over-alignment distance between two points.
+
+        Parameters
+        ----------
+        point_a : Tree or TreeBatch
+            A point in BHV Space.
+        point_b : Tree or TreeBatch
+            A point in BHV Space.
+
+        Returns
+        -------
+        dist : array-like, shape=[...]
+            The minimum-over-alignment distance between the two points.
+        """
+        aligned_point_a = self._total_space.aligner.align(point_a, point_b)
+        return self._total_space.metric.dist(aligned_point_a, point_b)
+
+    def squared_dist(self, point_a, point_b):
+        """Compute the minimum-over-alignment squared distance between two points.
+
+        Parameters
+        ----------
+        point_a : Tree or TreeBatch
+            A point in BHV Space.
+        point_b : Tree or TreeBatch
+            A point in BHV Space.
+
+        Returns
+        -------
+        squared_dist : array-like, shape=[...]
+            The minimum-over-alignment squared distance between the two points.
+        """
+        aligned_point_a = self._total_space.aligner.align(point_a, point_b)
+        return self._total_space.metric.squared_dist(aligned_point_a, point_b)
+
+    def geodesic(self, initial_point, end_point):
+        """Compute the geodesic between two points.
+
+        End point is aligned to initial point.
+
+        Parameters
+        ----------
+        initial_point : Tree or TreeBatch
+            A point in BHV Space.
+        end_point : Tree or TreeBatch
+            A point in BHV Space.
+
+        Returns
+        -------
+        geodesic : callable
+            The geodesic between the two points. Takes parameter t, that is the time
+            between 0 and 1 at which the corresponding point on the path is returned.
+        """
+        aligned_end_point = self._total_space.aligner.align(end_point, initial_point)
+        return self.geodesic_solver.geodesic(
+            initial_point=initial_point, end_point=aligned_end_point
+        )

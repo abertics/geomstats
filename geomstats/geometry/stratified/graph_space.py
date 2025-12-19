@@ -554,7 +554,6 @@ class GraphSpace(Matrices):
         """Equip manifold with group action."""
         if group_action == "permutations":
             group_action = PermutationAction()
-
         return super().equip_with_group_action(group_action)
 
 
@@ -566,7 +565,7 @@ class GraphSpaceAligner(Aligner):
     total_space : GraphSpace
         Set with quotient structure.
     align_algo : GraphSpaceAlignerAlgorithm
-        Algorihtm performing alignment.
+        Algorithm performing alignment.
     """
 
     MAP_ALIGNER = {
