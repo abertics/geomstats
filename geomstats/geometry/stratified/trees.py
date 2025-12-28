@@ -94,6 +94,24 @@ def generate_splits(labels, exclude_singletons=False):
     return splits
 
 
+def generate_n_splits(labels, n_splits):
+    """Generate random set of n_splits compatible splits of set ``labels``.
+
+    Parameters
+    ----------
+    labels : list[int]
+        A list of integers, the set of labels that we generate splits for.
+    n_splits : int
+        How many splits to return.
+
+    Returns
+    -------
+    splits : list[Split]
+        A list of splits of the set of labels.
+    """
+    return random.sample(generate_splits(labels, exclude_singletons=True), n_splits)
+
+
 def check_if_separated(labels, splits):
     """Check for each pair of labels if exists split that separates them.
 

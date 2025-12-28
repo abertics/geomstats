@@ -20,6 +20,7 @@ import itertools
 import itertools as it
 from abc import ABC
 
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 
@@ -158,6 +159,8 @@ class Tree(Point):
     def __init__(self, splits, lengths, n_labels=None):
         Tree._check_valid_lengths(lengths, len(splits))
 
+        self.basis_trees = []
+
         self.topology = TreeTopology(splits=splits, n_labels=n_labels)
         self.lengths = gs.array(
             [
@@ -212,6 +215,235 @@ class Tree(Point):
             return False
 
         return gs.all(gs.abs(self.lengths - point.lengths) < atol)
+
+    def compute_tree_in_standard_basis(self, total_space):
+        """Will be a list, possibly singleton."""
+        if self.basis_trees:
+            return self.basis_trees
+
+        # arbitrary just to orient
+        splits = []
+        for ft_split_pair in self.topology.splits:
+            p1, p2 = ft_split_pair.part1, ft_split_pair.part2
+            if len(p1) > len(p2):
+                splits.append(tuple(p1))
+            else:
+                splits.append(tuple(p2))
+
+        # order by biggest into smallest
+        ordered_splits = sorted(splits, key=lambda x: len(x), reverse=True)
+        # print("ordered_splits", ordered_splits)
+
+        self.basis_trees = []
+        how_many_biggest = np.sum(
+            [1 if len(x) == len(ordered_splits[0]) else 0 for x in ordered_splits]
+        )
+        for i in range(how_many_biggest):
+            # set biggest group to be 0...m continuous
+            # ie, {a,b,c} should -> {0, 1, 2}
+            biggest_split_part1 = set(ordered_splits[i])
+            biggest_split_part2 = (
+                set(range(self.topology.n_labels)) - biggest_split_part1
+            )
+
+            to_swap_from_p1 = []
+            for lab in biggest_split_part1:
+                if lab >= len(biggest_split_part1):
+                    to_swap_from_p1.append(lab)
+            to_swap_from_p2 = []
+            for lab in biggest_split_part2:
+                if lab < len(biggest_split_part1):
+                    to_swap_from_p2.append(lab)
+
+            ordering_perm = list(range(self.topology.n_labels))
+            for l1, l2 in zip(to_swap_from_p1, to_swap_from_p2):
+                ordering_perm[l1] = l2
+                ordering_perm[l2] = l1
+
+            relabeled = total_space.group_action(ordering_perm, self)
+            self.basis_trees.append(relabeled)
+        return self.basis_trees
+        # print("perm", ordering_perm)
+        # print("RELABELED", relabeled)
+
+        # for perm in total_space.aligner.align_algo._perms:
+        #     print(type(perm))
+
+        # print(ordered_splits)
+
+    def compare_in_basis_with_permutation(
+        self, other, total_space, longest_split_basis
+    ):
+        my_basis = self.compute_tree_in_standard_basis(total_space)
+        other_basis = other.compute_tree_in_standard_basis(total_space)
+
+        for my_tr in my_basis:
+            group1_perms = itertools.permutations(range(longest_split_basis))
+            group2_perms = itertools.permutations(
+                range(longest_split_basis, self.topology.n_labels)
+            )
+
+            for p1, p2 in itertools.product(group1_perms, group2_perms):
+                perm = p1 + p2
+
+                my_relabeled = total_space.group_action(perm, my_tr)
+
+                for other_tr in other_basis:
+                    if total_space.metric.dist(my_relabeled, other_tr) < 0.1:
+                        return True
+
+    def _to_networkx(self, root_id=None, pendant_edges=None, DEBUG=False):
+        r"""Return the networkx representation of the tree for visualisation.
+
+        Parameters
+        ----------
+        root_id : int\in[0,self.topology.n_labels)
+            This helps give orientation to networkx graph for visualisation. If None,
+            this function assumes, rather arbitrarily, that the last label is the root.
+        pendant_edges : array-like, shape=[self.topology.n_labels]
+            The pendant edge lengths, a vector containing positive numbers.
+        DEBUG : bool
+            If True will print lots.
+
+        Returns
+        -------
+        G : nx.DiGraph
+            Return networkx (nodes and edges) representation of the tree.
+        """
+        if not pendant_edges:
+            pendant_edges = gs.ones(self.topology.n_labels)
+
+        if not root_id:
+            root_id = self.topology.n_labels - 1
+
+        leaf_labels = list(range(self.topology.n_labels))
+        leaf_labels.remove(root_id)
+
+        leaf_labels = tuple(leaf_labels)
+
+        # star tree!! classic edge case *angry*
+        if len(self.topology.splits) == 0:
+            star = nx.DiGraph()
+            for leaf in leaf_labels:
+                star.add_edge(self.topology.n_labels, leaf)
+            star.add_edge(root_id, self.topology.n_labels)
+
+        # order splits by non-root-containing, to put root at top (arbitrary)
+        splits = []
+        for ft_split_pair in self.topology.splits:
+            p1, p2 = ft_split_pair.part1, ft_split_pair.part2
+            if root_id in p2:
+                splits.append(tuple(p1))
+            else:
+                splits.append(tuple(p2))
+
+        # convert splits to networkx
+        G = nx.DiGraph()
+        G.add_nodes_from(leaf_labels)
+
+        inner_labels = [tuple(split) for split in splits]
+        G.add_nodes_from(inner_labels)
+
+        if DEBUG:
+            print("SPLITS", splits)
+
+        # Root pendant edge
+        G.add_node(-1)
+        G.add_node(leaf_labels)
+        G.add_edge(
+            -1, leaf_labels, length=pendant_edges[root_id], weight=len(leaf_labels)
+        )
+        if DEBUG:
+            print("ADDING EDGE", -1, leaf_labels)
+
+        # Pendant edges
+        for i, pendant_edge in enumerate(pendant_edges):
+            if i == root_id:
+                continue
+
+            # find smallest subset she is in!
+            smallest_node, node_size = leaf_labels, len(leaf_labels)
+            for node in splits:
+                if i in node:
+                    if len(node) < node_size:
+                        smallest_node = node
+                        node_size = len(node)
+            if DEBUG:
+                print("ADDING EDGE", i, smallest_node)
+            G.add_edge(tuple(smallest_node), i, length=pendant_edge, weight=1)
+
+        # Splits
+        for split, split_length in zip(splits, self.lengths):
+            # find smallest subset she is in!
+            smallest_node, node_size = leaf_labels, len(leaf_labels)
+            for node in splits:
+                if set(split) < set(node):
+                    if len(node) < node_size:
+                        smallest_node = node
+                        node_size = len(node)
+
+            if DEBUG:
+                print("ADDING EDGE", split, smallest_node)
+
+            G.add_edge(
+                tuple(smallest_node), split, length=split_length, weight=len(split)
+            )
+
+        return G
+
+    @staticmethod
+    def _convert_nx_to_ahu(nx_g, root_node=-1):
+        if nx_g.out_degree(root_node) == 0:
+            return "()"
+
+        code = []
+        for child in nx_g.successors(root_node):
+            child_code = Tree._convert_nx_to_ahu(nx_g, child)
+            code.append(child_code)
+        code.sort()
+
+        return "(" + ",".join(code) + ")"
+
+    def _to_ahu(self, root_id):
+        nx_g = self._to_networkx(root_id=root_id)
+        return Tree._convert_nx_to_ahu(nx_g)
+
+    def get_all_possible_ahus(self):
+        all_ahus = set()
+        for root_id in range(self.topology.n_labels):
+            ahu = self._to_ahu(root_id=root_id)
+            all_ahus.add(ahu)
+        return all_ahus
+
+    def plot(self, root_id=None, pendant_edges=None, ax=None):
+        r"""Plot the networkx representation of the tree.
+
+        Parameters
+        ----------
+        root_id : int\in[0,self.topology.n_labels)
+            This helps give orientation to networkx graph for visualisation. If None,
+            this function assumes, rather arbitrarily, that the last label is the root.
+        pendant_edges : array-like, shape=[self.topology.n_labels]
+            The pendant edge lengths, a vector containing positive numbers.
+        ax : plt axis
+        """
+        if not root_id:
+            root_id = self.topology.n_labels - 1
+        if not ax:
+            ax = plt.gca()
+
+        nx_tree = self._to_networkx(root_id=root_id, pendant_edges=pendant_edges)
+        pos = nx.nx_agraph.graphviz_layout(nx_tree, prog="dot", root=root_id)
+        nx.draw(
+            nx_tree,
+            pos,
+            ax=ax,
+            with_labels=False,
+            node_size=100,
+            node_color="skyblue",
+            font_size=10,
+            edge_color="gray",
+        )
 
     @staticmethod
     def _check_valid_lengths(lengths, n_splits):
@@ -399,6 +631,16 @@ class TreeSpace(PointSet):
             return trees[0]
 
         return TreeBatch(trees)
+
+    def star_tree(self):
+        """Return origin in Tree space (ie, star tree :~) ).
+
+        Returns
+        -------
+        star_tree : Tree
+            Point at origin of Tree space.
+        """
+        return Tree([], [], n_labels=self.n_labels)
 
     def new(self, equip=True):
         """Create TreeSpace with same parameters."""
@@ -748,7 +990,8 @@ class GTPSolver:
             that are compatible with all splits in A, given edge length zero.
         common_b : dict
             Containing the splits of B that are also in A, as well as the splits of A
-            that are compatible with all splits in B, given edge length zero.
+            that are
+            le with all splits in B, given edge length zero.
         supports: dict
             Containing for each subtree the respective support.
         """
